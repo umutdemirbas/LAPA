@@ -87,7 +87,8 @@ if __name__ == "__main__":
 
 
     image = 'imgs/bridge_inference.jpg'
-    instruction ="take the broccoli out of the pot"
+    instruction = "pick up broccoli" #"take the broccoli out of the pot"
+    
     
     image = Image.open(image)
     image = np.array(image)

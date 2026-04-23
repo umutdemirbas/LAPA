@@ -19,7 +19,7 @@ laq = LatentActionQuantization(
 
 trainer = LAQTrainer(
     laq,
-    folder = '',
+    folder = '/cluster/scratch/udemirbas/LAPA/sth_v2_data/20bn-something-something-v2',
     offsets = 30,
     batch_size = 64,
     grad_accum_every = 1,
