@@ -249,7 +249,13 @@ def load_model_checkpoint(model, checkpoint_path: Path, device: torch.device):
     }
 
 
-def extract_latents(model, loader, device: torch.device, max_samples: int):
+def extract_latents(model, loader, device: torch.device, max_samples: int, latent_strategy: str = "quantized_flat"):
+    """
+    Extract latents with different strategies:
+    - 'quantized_flat': flatten VQ quantized output (original)
+    - 'encoded_tokens_pooled': mean-pool encoded tokens before VQ (RECOMMENDED)
+    - 'encoded_tokens_flat': flatten encoded tokens before VQ
+    """
     latent_list = []
     index_list = []
     verbs = []
@@ -276,7 +282,17 @@ def extract_latents(model, loader, device: torch.device, max_samples: int):
             # VQ takes both tokens together
             quantized, perplexity, codebook_usage, indices = model.vq(first_tokens_packed, last_tokens_packed)
             
-            latents = quantized.flatten(start_dim=1)
+            # Choose latent representation strategy
+            if latent_strategy == "encoded_tokens_pooled":
+                # Mean-pool encoded tokens: more stable, avoids VQ collapse
+                latents = (first_tokens_packed.mean(dim=1) + last_tokens_packed.mean(dim=1)) / 2
+            elif latent_strategy == "encoded_tokens_flat":
+                # Flatten encoded tokens before VQ
+                latents = torch.cat([first_tokens_packed, last_tokens_packed], dim=1)
+            else:  # quantized_flat (original)
+                # Flatten VQ quantized output
+                latents = quantized.flatten(start_dim=1)
+            
             codes = indices
 
             latent_list.append(latents.detach().cpu().numpy())
@@ -517,43 +533,93 @@ def run(args):
     model = create_model(device)
     load_info = load_model_checkpoint(model, checkpoint_path, device)
 
+    # Extract latents with specified strategy
+    latent_strategy = getattr(args, 'latent_strategy', 'quantized_flat')
     X, indices, verbs, actions, sample_ids = extract_latents(
         model=model,
         loader=loader,
         device=device,
         max_samples=args.max_samples,
+        latent_strategy=latent_strategy,
     )
 
     step = checkpoint_path.stem.split(".")[-1]
     out_dir = Path(args.output_dir) / f"action_verb_analysis_step_{step}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Feature normalization (important for t-SNE)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Log diagnostic info about latent quality
+    print(f"Latent strategy: {latent_strategy}")
+    print(f"Raw latent shape: {X.shape}, mean={X.mean():.4f}, std={X.std():.4f}")
+    print(f"Scaled latent shape: {X_scaled.shape}, mean={X_scaled.mean():.4f}, std={X_scaled.std():.4f}")
+
     # Dimensionality reductions
     pca2 = PCA(n_components=2, random_state=42)
-    X_pca = pca2.fit_transform(X)
+    X_pca = pca2.fit_transform(X_scaled)
 
-    tsne_n = min(args.tsne_samples, len(X))
-    tsne_idx = np.random.choice(len(X), size=tsne_n, replace=False)
-    X_tsne_in = X[tsne_idx]
+    # Stratified sampling for t-SNE (ensures representation of all verbs/actions)
+    tsne_n = min(args.tsne_samples, len(X_scaled))
+    
+    # Use stratified sampling if dataset is large enough
+    unique_verbs = len(np.unique(verbs))
+    if tsne_n > unique_verbs * 10:  # enough samples for stratification
+        from sklearn.model_selection import train_test_split
+        # Stratified split to get representative sample
+        indices_to_keep, _ = train_test_split(
+            np.arange(len(X_scaled)),
+            train_size=tsne_n,
+            stratify=verbs,
+            random_state=42
+        )
+        tsne_idx = indices_to_keep
+    else:
+        tsne_idx = np.random.choice(len(X_scaled), size=tsne_n, replace=False)
+    
+    X_tsne_in = X_scaled[tsne_idx]
     verbs_tsne = verbs[tsne_idx]
     actions_tsne = actions[tsne_idx]
 
     if tsne_n >= 10:
+        # Adaptive perplexity: larger datasets benefit from higher perplexity
+        # Rule of thumb: perplexity should be roughly 5-50, but can go higher for large datasets
+        adaptive_perplexity = min(
+            args.tsne_perplexity,
+            max(5, int(np.sqrt(tsne_n) / 2))  # adaptive: sqrt(n)/2, capped at tsne_perplexity
+        )
+        
+        print(f"t-SNE config: n_samples={tsne_n}, perplexity={adaptive_perplexity} (adaptive)")
+        
         tsne = TSNE(
             n_components=2,
             random_state=42,
-            perplexity=min(args.tsne_perplexity, max(5, tsne_n - 1)),
+            perplexity=adaptive_perplexity,
             init="pca",
             learning_rate="auto",
+            n_iter=1000,  # explicit iterations for reproducibility
+            verbose=1,
         )
         X_tsne = tsne.fit_transform(X_tsne_in)
     else:
         X_tsne = X_tsne_in[:, :2]
 
     # Metrics
-    verb_metrics = separability_metrics(X, verbs, metric_name="verb")
-    action_metrics = separability_metrics(X, actions, metric_name="action")
+    verb_metrics = separability_metrics(X_scaled, verbs, metric_name="verb")
+    action_metrics = separability_metrics(X_scaled, actions, metric_name="action")
     codebook_metrics = global_codebook_metrics(indices)
+    
+    # Print diagnostic info to console
+    print("\n" + "="*80)
+    print("LATENT SPACE QUALITY DIAGNOSTICS")
+    print("="*80)
+    print(f"Verb Metrics: linear_probe_acc={verb_metrics.get('linear_probe_acc', 'N/A'):.3f}, silhouette={verb_metrics.get('silhouette', 'N/A'):.3f}")
+    print(f"Action Metrics: linear_probe_acc={action_metrics.get('linear_probe_acc', 'N/A'):.3f}, silhouette={action_metrics.get('silhouette', 'N/A'):.3f}")
+    if verb_metrics.get('linear_probe_acc', 0) < 0.5:
+        print("⚠ WARNING: Poor verb linear probe accuracy suggests weak semantic encoding!")
+        print("   Consider: (1) using encoded_tokens_pooled strategy, (2) larger model, (3) better pretraining")
+    print("="*80 + "\n")
 
     # Visuals
     scatter_top_labels(
@@ -657,8 +723,19 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--offset", type=int, default=30)
 
+    parser.add_argument(
+        "--latent-strategy",
+        type=str,
+        default="quantized_flat",
+        choices=["quantized_flat", "encoded_tokens_pooled", "encoded_tokens_flat"],
+        help="Strategy for extracting latent representations: "
+             "quantized_flat (original, VQ quantized + flattened), "
+             "encoded_tokens_pooled (RECOMMENDED: mean pooled encoded tokens), "
+             "encoded_tokens_flat (flattened encoded tokens before VQ)"
+    )
+
     parser.add_argument("--tsne-samples", type=int, default=2500)
-    parser.add_argument("--tsne-perplexity", type=int, default=30)
+    parser.add_argument("--tsne-perplexity", type=int, default=50)
     parser.add_argument("--top-n-labels", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
