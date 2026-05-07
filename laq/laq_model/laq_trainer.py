@@ -2,6 +2,7 @@ from math import sqrt
 from random import choice
 from pathlib import Path
 from shutil import rmtree
+import os
 import wandb
 
 from beartype import beartype
@@ -120,20 +121,24 @@ class LAQTrainer(nn.Module):
 
         self.valid_ds = self.ds
 
+        num_workers = max(0, int(os.environ.get('LAQ_NUM_WORKERS', 2)))
+        dataloader_kwargs = dict(
+            batch_size = batch_size,
+            num_workers = num_workers,
+            pin_memory = True,
+        )
+        if num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = 2
 
         self.dl = DataLoader(
             self.ds,
-            batch_size = batch_size,
-            shuffle=True,
-            num_workers=4,  # or more depending on your CPU cores
-            pin_memory=True,  # Helps with faster data transfer to GPU
-            prefetch_factor=2,
+            shuffle = True,
+            **dataloader_kwargs,
             )
 
         self.valid_dl = DataLoader(
             self.valid_ds,
-            batch_size = batch_size,
-            num_workers = 4)
+            **dataloader_kwargs)
 
         if exists(self.vae.discr):
             (

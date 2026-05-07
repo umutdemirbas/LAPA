@@ -25,11 +25,11 @@ trainer = LAQTrainer(
     grad_accum_every = 1,
     train_on_images = False, 
     use_ema = False,          
-    num_train_steps = 100005,
-    results_folder='results',
+    num_train_steps = 80005,
+    results_folder='results_v3',
     lr=1e-4,
-    save_model_every=5000,
-    save_results_every=5000,
+    save_model_every=1000,
+    save_results_every=1000,
 )
 
 trainer.train()        
