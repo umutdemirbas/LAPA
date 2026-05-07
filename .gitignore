@@ -4,3 +4,4 @@ wandb/*
 sth_v2_data/*
 logs/*
 laq/model_analysis/*
+reconstructions/*
